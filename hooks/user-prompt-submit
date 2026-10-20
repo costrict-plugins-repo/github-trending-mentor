@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# UserPromptSubmit hook — AI-powered prompt coaching via additionalContext
+# Part of mentor plugin (v3.1)
+#
+# Evaluates the user's prompt with Claude Haiku before it reaches Claude.
+# On a high-confidence match, injects a coaching note as additionalContext.
+# Always exits 0 — never blocks a prompt.
+
+set -euo pipefail
+
+# Skip if this is an internal mentor call (prevents recursive evaluation)
+[[ -n "${MENTOR_INTERNAL:-}" ]] && exit 0
+
+COACHING_DIR="${HOME}/.claude/coaching"
+CONFIG_FILE="${COACHING_DIR}/config.json"
+PHILOSOPHY_FILE="${COACHING_DIR}/philosophy.md"
+USER_MODEL_FILE="${COACHING_DIR}/user-model.json"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULTS_DIR="$(cd "${SCRIPT_DIR}/../defaults" && pwd 2>/dev/null || echo "")"
+EVALUATE_SCRIPT="${SCRIPT_DIR}/lib/evaluate-prompt.sh"
+
+mkdir -p "$COACHING_DIR"
+DBG() { echo "[$(date -Iseconds)] MENTOR-DBG $*" >> "${COACHING_DIR}/hook-debug.log" 2>/dev/null || true; }
+
+# ─── Reset trap: clear any persisted additionalContext when not coaching ──────
+# Without this, a coaching note injected on one prompt persists into all
+# subsequent prompts because Claude Code keeps additionalContext in session context.
+_EMIT_RESET=false
+_COACHING_EMITTED=false
+_EXIT_REASON="unknown"
+_reset_context() {
+    DBG "EXIT-TRAP: reason=${_EXIT_REASON} _EMIT_RESET=${_EMIT_RESET} _COACHING_EMITTED=${_COACHING_EMITTED}"
+    if [[ "$_EMIT_RESET" == "true" ]] && [[ "$_COACHING_EMITTED" == "false" ]]; then
+        local RESET_JSON='{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":""}}'
+        DBG "EXIT-TRAP: emitting reset → ${RESET_JSON}"
+        printf '%s\n' "$RESET_JSON"
+    fi
+}
+trap _reset_context EXIT
+
+# ─── Sweep orphaned session files (crashed sessions) ─────────────────────────
+find "$COACHING_DIR" -name 'session-*.tmp' -mtime +1 -delete 2>/dev/null || true
+
+# ─── Resolve jq (auto-installs on first use) ──────────────────────────────────
+# shellcheck source=lib/bootstrap-jq.sh
+source "${SCRIPT_DIR}/lib/bootstrap-jq.sh" || exit 0
+
+# ─── Read stdin ───────────────────────────────────────────────────────────────
+INPUT=$(cat)
+
+PROMPT=$(     echo "$INPUT" | "$JQ" -r '.prompt     // ""' 2>/dev/null || echo "")
+SESSION_ID=$( echo "$INPUT" | "$JQ" -r '.session_id // ""' 2>/dev/null || echo "")
+
+[[ -z "$PROMPT" ]] && { _EXIT_REASON="empty-prompt"; exit 0; }
+_EMIT_RESET=true   # real prompt — any non-coaching exit should now reset context
+DBG "prompt='${PROMPT:0:80}' session='${SESSION_ID:-EMPTY}'"
+
+# ─── Load settings (defaults if config missing) ───────────────────────────────
+ENABLED="true"
+MODE="chill"
+BOOTSTRAP_MIN=20
+COOLDOWN_SECONDS=30
+HISTORY_SIZE=10
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    ENABLED=$(         "$JQ" -r 'if .enabled == false then "false" else "true" end' "$CONFIG_FILE" 2>/dev/null || echo "true")
+    MODE=$(            "$JQ" -r '.mode               // "chill"' "$CONFIG_FILE" 2>/dev/null || echo "chill")
+    BOOTSTRAP_MIN=$(   "$JQ" -r '.bootstrap_min      // 20'     "$CONFIG_FILE" 2>/dev/null || echo "20")
+    COOLDOWN_SECONDS=$("$JQ" -r '.cooldown_seconds   // 30'     "$CONFIG_FILE" 2>/dev/null || echo "30")
+    HISTORY_SIZE=$(    "$JQ" -r '.prompt_history_size // 10'     "$CONFIG_FILE" 2>/dev/null || echo "10")
+fi
+
+[[ "$ENABLED" != "true" ]] && { _EXIT_REASON="disabled"; exit 0; }
+
+# ─── Guard: bootstrap minimum ────────────────────────────────────────────────
+LOG_FILE="${COACHING_DIR}/interactions.jsonl"
+if [[ -f "$LOG_FILE" ]]; then
+    INTERACTION_COUNT=$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    if (( INTERACTION_COUNT < BOOTSTRAP_MIN )); then
+        DBG "bootstrap: BLOCKED count=${INTERACTION_COUNT} < min=${BOOTSTRAP_MIN}"
+        _EXIT_REASON="bootstrap-pending"
+        exit 0
+    fi
+fi
+
+STATE_FILE="${COACHING_DIR}/session-${SESSION_ID}.tmp"
+
+# ─── Build skill catalog (always fresh from installed_plugins.json) ──────────
+SKILL_CATALOG="[]"
+INSTALLED_PLUGINS="${HOME}/.claude/plugins/installed_plugins.json"
+
+if [[ -f "$INSTALLED_PLUGINS" ]]; then
+    CATALOG_ENTRIES="[]"
+    while IFS= read -r install_path; do
+        [[ -z "$install_path" ]] && continue
+        for skill_md in "$install_path"/skills/*/SKILL.md; do
+            [[ -f "$skill_md" ]] || continue
+            skill_dir=$(basename "$(dirname "$skill_md")")
+
+            # Skip meta-skills and self-referential skills
+            case "$skill_dir" in
+                using-*|mentor|mentor-recap) continue ;;
+            esac
+
+            # Extract name and description from YAML frontmatter
+            skill_name=""
+            skill_desc=""
+            in_frontmatter=false
+            in_desc=false
+            while IFS= read -r line; do
+                line="${line%$'\r'}"
+                if [[ "$line" == "---" ]]; then
+                    if [[ "$in_frontmatter" == "true" ]]; then
+                        break
+                    fi
+                    in_frontmatter=true
+                    continue
+                fi
+                if [[ "$in_frontmatter" == "true" ]]; then
+                    if [[ "$line" =~ ^name:\ *(.*) ]]; then
+                        skill_name="${BASH_REMATCH[1]}"
+                        in_desc=false
+                    elif [[ "$line" =~ ^description:\ *\>-?$ ]]; then
+                        in_desc=true
+                        skill_desc=""
+                    elif [[ "$line" =~ ^description:\ *\"(.*)\"$ ]]; then
+                        skill_desc="${BASH_REMATCH[1]}"
+                        in_desc=false
+                    elif [[ "$line" =~ ^description:\ *(.*) ]]; then
+                        skill_desc="${BASH_REMATCH[1]}"
+                        in_desc=true
+                    elif [[ "$in_desc" == "true" ]]; then
+                        if [[ "$line" =~ ^[a-z_]+: ]] || [[ -z "$line" ]]; then
+                            in_desc=false
+                        else
+                            skill_desc="${skill_desc} $(echo "$line" | sed 's/^[[:space:]]*//')"
+                        fi
+                    fi
+                fi
+            done < "$skill_md"
+
+            # Use directory name as fallback for skill name
+            [[ -z "$skill_name" ]] && skill_name="$skill_dir"
+
+            # Skip skills with no trigger description
+            skill_desc=$(echo "$skill_desc" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [[ -z "$skill_desc" ]] && continue
+
+            # Truncate description to 200 chars
+            skill_desc="${skill_desc:0:200}"
+
+            CATALOG_ENTRIES=$(echo "$CATALOG_ENTRIES" | "$JQ" -c \
+                --arg name "$skill_name" \
+                --arg trigger "$skill_desc" \
+                '. + [{"name": $name, "trigger": $trigger}]' 2>/dev/null || echo "$CATALOG_ENTRIES")
+        done
+    done < <("$JQ" -r '.plugins | to_entries[] | .value[0].installPath // empty' "$INSTALLED_PLUGINS" 2>/dev/null)
+
+    SKILL_CATALOG="$CATALOG_ENTRIES"
+fi
+DBG "skill_catalog: entries=$(echo "$SKILL_CATALOG" | "$JQ" 'length' 2>/dev/null || echo '?')"
+
+# ─── Guard: skill invocations ─────────────────────────────────────────────────
+if echo "$PROMPT" | grep -qE "^/[a-z]"; then
+    _SKILL_WITH_SLASH=$(echo "$PROMPT" | grep -oE "^/[a-z][a-z0-9:-]*" | head -1 || echo "")
+    _SKILL_BARE="${_SKILL_WITH_SLASH#/}"
+    if [[ -n "$SESSION_ID" ]]; then
+        _IN_CAT=$(printf '%s' "$SKILL_CATALOG" | "$JQ" -r --arg s "$_SKILL_BARE" \
+            'any(.[]; .name == $s)' 2>/dev/null || echo "false")
+        if [[ "$_IN_CAT" == "true" ]]; then
+            DBG "skill-capture: MATCH skill=${_SKILL_WITH_SLASH} → writing state"
+            if [[ -f "$STATE_FILE" ]]; then
+                _MERGED=$(cat "$STATE_FILE" 2>/dev/null | "$JQ" -c --arg s "$_SKILL_WITH_SLASH" \
+                    '. + {skill_invoked: $s, coaching_triggered: false}' 2>/dev/null) || true
+            else
+                _MERGED=$("$JQ" -n -c --arg s "$_SKILL_WITH_SLASH" \
+                    '{skill_invoked: $s, coaching_triggered: false}' 2>/dev/null) || true
+            fi
+            if [[ -n "$_MERGED" ]]; then
+                _TMP="${STATE_FILE}.tmp.$$"
+                printf '%s\n' "$_MERGED" > "$_TMP" 2>/dev/null \
+                    && mv "$_TMP" "$STATE_FILE" 2>/dev/null \
+                    || { rm -f "$_TMP" 2>/dev/null || true; DBG "skill-capture: WARN state write failed"; } || true
+            else
+                DBG "skill-capture: WARN state write failed"
+            fi
+        else
+            DBG "skill-capture: NO-MATCH skill=${_SKILL_WITH_SLASH} (not in catalog)"
+        fi
+    fi
+    _EXIT_REASON="slash-command"
+    exit 0
+fi
+
+# ─── Guard: conversational affirmations ───────────────────────────────────────
+PROMPT_TRIMMED=$(echo "$PROMPT" | tr '[:upper:]' '[:lower:]' | tr -d '[:punct:]' | xargs)
+AFFIRMATIONS="^(yes|no|ok|okay|sure|yep|nope|yup|nah|agreed|correct|exactly|right|proceed|continue|go ahead|do it|sounds good|looks good|make it so|that works|perfect|great|fine|done|got it)$"
+echo "$PROMPT_TRIMMED" | grep -qiE "$AFFIRMATIONS" && { _EXIT_REASON="affirmation"; exit 0; }
+
+# ─── Clear stale skill_invoked (this is a normal prompt, not a skill invocation) ─
+if [[ -n "$SESSION_ID" ]] && [[ -f "$STATE_FILE" ]]; then
+    _PREV_SKILL=$("$JQ" -r '.skill_invoked // ""' "$STATE_FILE" 2>/dev/null || echo "")
+    if [[ -n "$_PREV_SKILL" ]]; then
+        DBG "skill-capture: CLEAR (was ${_PREV_SKILL})"
+        _MERGED=$(cat "$STATE_FILE" 2>/dev/null | "$JQ" -c '. + {skill_invoked: null}' 2>/dev/null) || true
+        if [[ -n "$_MERGED" ]]; then
+            _TMP="${STATE_FILE}.tmp.$$"
+            printf '%s\n' "$_MERGED" > "$_TMP" 2>/dev/null \
+                && mv "$_TMP" "$STATE_FILE" 2>/dev/null \
+                || rm -f "$_TMP" 2>/dev/null || true
+        fi
+    fi
+fi
+
+# ─── Guard: per-session cooldown ─────────────────────────────────────────────
+DBG "cooldown: session='${SESSION_ID:-EMPTY}' state_file=$([ -f "$STATE_FILE" ] && echo exists || echo missing) ls=$(ls -la "$STATE_FILE" 2>&1 || true)"
+if [[ -n "$SESSION_ID" ]] && [[ -f "$STATE_FILE" ]]; then
+    LAST_TS=$("$JQ" -r '.last_intervention_ts // 0' "$STATE_FILE" 2>/dev/null || echo "0")
+    NOW_EPOCH=$(date +%s)
+    ELAPSED=$(( NOW_EPOCH - LAST_TS ))
+    if [[ "$ELAPSED" -lt "$COOLDOWN_SECONDS" ]]; then
+        DBG "cooldown: BLOCKED elapsed=${ELAPSED}s < ${COOLDOWN_SECONDS}s"
+        _EXIT_REASON="cooldown-blocked"
+        exit 0
+    fi
+    DBG "cooldown: passed elapsed=${ELAPSED}s"
+fi
+
+# ─── Guard: evaluate script must exist ───────────────────────────────────────
+[[ ! -f "$EVALUATE_SCRIPT" ]] && { _EXIT_REASON="no-evaluator"; exit 0; }
+
+# ─── Read prompt history from Claude Code history ────────────────────────────
+HISTORY_FILE="${HOME}/.claude/history.jsonl"
+HISTORY_JSON="[]"
+if [[ -f "$HISTORY_FILE" ]] && [[ -n "$SESSION_ID" ]]; then
+    HISTORY_LINES=$(tac "$HISTORY_FILE" \
+        | "$JQ" --arg sid "$SESSION_ID" -r 'select(.sessionId == $sid) | .display' 2>/dev/null \
+        | grep -v "^/" \
+        | grep -vxF "$PROMPT" \
+        | head -n "$HISTORY_SIZE" \
+        | tac \
+        | cut -c1-500) || true
+
+    if [[ -n "$HISTORY_LINES" ]]; then
+        HISTORY_JSON=$(printf '%s\n' "$HISTORY_LINES" | "$JQ" -R . | "$JQ" -s . 2>/dev/null || echo "[]")
+    fi
+fi
+
+# ─── Guard: short mid-conversation follow-ups ───────────────────────────────
+# When the user is mid-conversation (prior prompts exist), short prompts
+# are almost always answers to questions Claude asked. The evaluator can't
+# see Claude's responses, so it can't verify — skip evaluation entirely.
+TURN_COUNT=$(echo "$HISTORY_JSON" | "$JQ" 'length' 2>/dev/null || echo "0")
+if [[ "$TURN_COUNT" -gt 0 ]]; then
+    WORD_COUNT=$(echo "$PROMPT" | wc -w | tr -d ' ')
+    if [[ "$WORD_COUNT" -le 4 ]]; then
+        DBG "short-followup: skipping (${WORD_COUNT} words, turn $((TURN_COUNT + 1)))"
+        _EXIT_REASON="short-followup"
+        exit 0
+    fi
+    # Option-selection patterns: "approach A", "option 2", "the first one", etc.
+    if echo "$PROMPT_TRIMMED" | grep -qiE "^(option|approach|choice|plan|alternative) [a-z0-9]$"; then
+        DBG "option-selection: skipping mid-conversation option pick"
+        _EXIT_REASON="option-selection"
+        exit 0
+    fi
+    if echo "$PROMPT_TRIMMED" | grep -qiE "^the (first|second|third|last|other) (one|option|approach)$"; then
+        DBG "option-selection: skipping mid-conversation selection"
+        _EXIT_REASON="option-selection"
+        exit 0
+    fi
+fi
+
+# ─── Bootstrap: seed defaults if missing ─────────────────────────────────────
+if [[ ! -f "$PHILOSOPHY_FILE" ]] && [[ -n "$DEFAULTS_DIR" ]] && [[ -f "${DEFAULTS_DIR}/philosophy.md" ]]; then
+    cp "${DEFAULTS_DIR}/philosophy.md" "$PHILOSOPHY_FILE" 2>/dev/null || true
+fi
+
+if [[ ! -f "$USER_MODEL_FILE" ]]; then
+    printf '{"strengths":[],"weaknesses":[],"current_focus":"","recent_progress":"","intervention_history":[]}\n' \
+        > "$USER_MODEL_FILE" 2>/dev/null || true
+fi
+
+# ─── Seed user model from insights if empty and facets available ────────────
+SEED_SCRIPT="${SCRIPT_DIR}/lib/seed-user-model.sh"
+if [[ -f "$SEED_SCRIPT" ]] && [[ -f "$USER_MODEL_FILE" ]]; then
+    MODEL_EMPTY=$("$JQ" -r '
+        if ((.strengths // []) | length == 0)
+           and ((.weaknesses // []) | length == 0)
+           and ((.current_focus // "") | length == 0)
+        then "true" else "false" end' "$USER_MODEL_FILE" 2>/dev/null || echo "false")
+    FACETS_DIR="${HOME}/.claude/usage-data/facets"
+    if [[ "$MODEL_EMPTY" == "true" ]] && [[ -d "$FACETS_DIR" ]]; then
+        FACET_COUNT=$(find "$FACETS_DIR" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$FACET_COUNT" -gt 0 ]]; then
+            DBG "seeding: model empty, ${FACET_COUNT} facets available — running seeder"
+            _timeout 10 bash "$SEED_SCRIPT" 2>/dev/null || true
+        fi
+    fi
+fi
+
+# ─── Load philosophy and user model ──────────────────────────────────────────
+PHILOSOPHY=""
+[[ -f "$PHILOSOPHY_FILE" ]] && PHILOSOPHY=$(cat "$PHILOSOPHY_FILE" 2>/dev/null || echo "")
+
+USER_MODEL="{}"
+[[ -f "$USER_MODEL_FILE" ]] && USER_MODEL=$(cat "$USER_MODEL_FILE" 2>/dev/null || echo "{}")
+
+# ─── Build payload and call evaluate-prompt.sh ───────────────────────────────
+PAYLOAD=$("$JQ" -n \
+    --arg     prompt     "$PROMPT" \
+    --arg     mode       "$MODE" \
+    --arg     philosophy "$PHILOSOPHY" \
+    --argjson user_model "$USER_MODEL" \
+    --argjson history    "$HISTORY_JSON" \
+    --argjson skill_catalog "$SKILL_CATALOG" \
+    '{prompt: $prompt, mode: $mode, philosophy: $philosophy, user_model: $user_model, history: $history, skill_catalog: $skill_catalog}' \
+    2>/dev/null) || exit 0
+
+JUDGMENT=$(printf '%s' "$PAYLOAD" | _timeout 28 bash "$EVALUATE_SCRIPT" 2>/dev/null \
+    || echo '{"intervene":false}')
+DBG "judgment: $(printf '%s' "$JUDGMENT" | tr -d '\n')"
+
+# ─── Parse judgment ───────────────────────────────────────────────────────────
+INTERVENE=$(        echo "$JUDGMENT" | "$JQ" -r '.intervene // false' 2>/dev/null || echo "false")
+[[ "$INTERVENE" != "true" ]] && { _EXIT_REASON="no-intervention"; exit 0; }
+
+INTERVENTION_TYPE=$(echo "$JUDGMENT" | "$JQ" -r '.type    // "nudge"' 2>/dev/null || echo "nudge")
+FEEDBACK=$(         echo "$JUDGMENT" | "$JQ" -r '.message // ""'      2>/dev/null || echo "")
+[[ -z "$FEEDBACK" ]] && { _EXIT_REASON="empty-feedback"; exit 0; }
+
+FRICTION=$(         echo "$JUDGMENT" | "$JQ" -r '.friction         // ""'    2>/dev/null || echo "")
+SKILL_SUGGESTED=$(  echo "$JUDGMENT" | "$JQ" -r '.skill_suggested         // ""'    2>/dev/null || echo "")
+SKILL_GAP_DESC=$(   echo "$JUDGMENT" | "$JQ" -r '.skill_gap_description   // ""'    2>/dev/null || echo "")
+
+# ─── Write session state (only reached when coaching fires; coaching_triggered is always true here) ─
+NOW_EPOCH=$(date +%s)
+FRICTION_ARGS=()
+[[ -n "$FRICTION" ]] && FRICTION_ARGS=(--arg friction "$FRICTION")
+SKILL_ARGS=()
+[[ -n "$SKILL_SUGGESTED" ]] && SKILL_ARGS+=(--arg skill_suggested "$SKILL_SUGGESTED")
+[[ -n "$SKILL_GAP_DESC" ]] && SKILL_ARGS+=(--arg skill_gap_description "$SKILL_GAP_DESC")
+
+_TMP_STATE="${STATE_FILE}.tmp.$$"
+"$JQ" -n \
+    --argjson ts "$NOW_EPOCH" \
+    --argjson coaching_triggered true \
+    --arg     type    "$INTERVENTION_TYPE" \
+    --arg     message "$FEEDBACK" \
+    "${FRICTION_ARGS[@]+"${FRICTION_ARGS[@]}"}" \
+    "${SKILL_ARGS[@]+"${SKILL_ARGS[@]}"}" \
+    '{last_intervention_ts: $ts, coaching_triggered: $coaching_triggered, type: $type, message: $message}
+     + (if $ARGS.named | has("friction") then {friction: $friction} else {} end)
+     + (if $ARGS.named | has("skill_suggested") then {skill_suggested: $skill_suggested} else {} end)
+     + (if $ARGS.named | has("skill_gap_description") then {skill_gap_description: $skill_gap_description} else {} end)' \
+    > "$_TMP_STATE" 2>/dev/null \
+    && mv "$_TMP_STATE" "$STATE_FILE" 2>/dev/null \
+    || { rm -f "$_TMP_STATE" 2>/dev/null || true; } || true
+DBG "state_write: path=$STATE_FILE coaching=true type=$INTERVENTION_TYPE friction=${FRICTION:-none} exists=$([ -f "$STATE_FILE" ] && echo yes || echo no)"
+
+# ─── Format coaching message ──────────────────────────────────────────────────
+case "$INTERVENTION_TYPE" in
+    nudge)         PREFIX="💡 Mentor (nudge):" ;;
+    correction)    PREFIX="⚡ Mentor:" ;;
+    challenge)     PREFIX="🔥 Mentor (pushback):" ;;
+    reinforcement) PREFIX="✅ Mentor:" ;;
+    *)             PREFIX="💡 Mentor:" ;;
+esac
+
+FULL_MSG="${PREFIX} ${FEEDBACK}"
+
+# ─── Build and output hookSpecificOutput (jq handles all JSON escaping) ───────
+CONTEXT=$(printf '<prompt-coaching-note>\nBefore responding, output this exact line verbatim, then proceed with your answer:\n\n%s\n</prompt-coaching-note>' "$FULL_MSG")
+
+_COACHING_EMITTED=true   # prevent reset trap from firing
+_EXIT_REASON="coaching-emitted"
+DBG "STDOUT: emitting coaching additionalContext (${#CONTEXT} chars)"
+"$JQ" -n \
+    --arg context "$CONTEXT" \
+    '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $context}}'
+
+exit 0

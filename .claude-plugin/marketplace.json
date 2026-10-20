@@ -1,0 +1,26 @@
+{
+  "name": "mentor",
+  "owner": {
+    "name": "Shawn Choleva"
+  },
+  "metadata": {
+    "description": "Inline prompt coaching for Claude Code — heuristic feedback before prompts are submitted, with interaction logging and behavioral pattern detection"
+  },
+  "plugins": [
+    {
+      "name": "mentor",
+      "source": "./",
+      "description": "AI-powered inline coaching system. Uses Claude haiku to evaluate prompt quality against a configurable philosophy and persistent user model. Fires typed interventions (nudge, correction, challenge, reinforcement) and evolves its understanding of the user over time.",
+      "version": "3.4.8",
+      "license": "MIT",
+      "keywords": [
+        "coaching",
+        "prompt-quality",
+        "productivity",
+        "heuristics",
+        "logging"
+      ],
+      "category": "developer-experience"
+    }
+  ]
+}
